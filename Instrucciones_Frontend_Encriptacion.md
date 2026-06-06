@@ -7,8 +7,10 @@ Repositorio: https://github.com/JoseDanielJ/chat
 ## 1. Instalación
 
 ```bash
-npx expo install tweetnacl tweetnacl-util react-native-get-random-values expo-secure-store
+npx expo install tweetnacl @stablelib/utf8 @stablelib/base64 react-native-get-random-values expo-secure-store
 ```
+
+> **Nota sobre `tweetnacl-util`:** El paquete `tweetnacl-util` NO funciona en React Native (según [su documentación oficial](https://www.npmjs.com/package/tweetnacl-util)). En su lugar se usan `@stablelib/utf8` y `@stablelib/base64`, recomendados por el mismo autor de `tweetnacl-util`.
 
 ---
 
@@ -18,7 +20,8 @@ npx expo install tweetnacl tweetnacl-util react-native-get-random-values expo-se
 ```js
 import 'react-native-get-random-values';
 import nacl from 'tweetnacl';
-import { encodeBase64, decodeBase64, encodeUTF8, decodeUTF8 } from 'tweetnacl-util';
+import { encode as encodeUTF8, decode as decodeUTF8 } from '@stablelib/utf8';
+import { encode as encodeBase64, decode as decodeBase64 } from '@stablelib/base64';
 
 export function generateKeyPair() {
   const kp = nacl.box.keyPair();
@@ -184,8 +187,9 @@ El handler existe donde se llama `wsRef.current.onEvent(...)`. Agregar o modific
 
 ```ts
 case 'group_key':
-  setGroupKey(event.key);
-  // Si hay historial pendiente sin descifrar, descifrarlo aquí
+  // Si el servidor no tiene configurada la clave grupal, se recibe una cadena vacía.
+  // En ese caso, groupKey se mantiene null y los mensajes se envían/reciben en texto plano.
+  setGroupKey(event.key || null);
   break;
 
 case 'users_list':
@@ -205,7 +209,7 @@ case 'user_joined':
   break;
 
 case 'group_message': {
-  const plaintext = groupKey ? decryptGroup(event.message.content, groupKey) : null;
+  const plaintext = groupKey ? decryptGroup(event.message.content, groupKey) : event.message.content;
   setGroupMessages(prev => [...prev, { ...event.message, content: plaintext ?? '[mensaje no descifrable]' }]);
   break;
 }
@@ -218,17 +222,18 @@ case 'group_history': {
 }
 
 case 'dm': {
+  // El remitente NO puede descifrar su propio eco — nacl.box solo lo permite al destinatario.
+  // Los mensajes enviados deben mostrarse vía inserción optimista (ver sección 7.7).
+  if (event.message.sender_id === currentUser?.id) break;
+
   const senderKey = userPublicKeys[event.message.sender_id];
   const plaintext = senderKey && myKeyPair.secretKey
     ? decryptDM(event.message.content, senderKey, myKeyPair.secretKey)
     : null;
   // Agregar a directMessages igual que hoy, pero con content descifrado
-  const dmKey = event.message.sender_id === currentUser?.id
-    ? event.message.recipient_id!
-    : event.message.sender_id;
   setDirectMessages(prev => ({
     ...prev,
-    [dmKey]: [...(prev[dmKey] ?? []), { ...event.message, content: plaintext ?? '[mensaje no descifrable]' }],
+    [event.message.sender_id]: [...(prev[event.message.sender_id] ?? []), { ...event.message, content: plaintext ?? '[mensaje no descifrable]' }],
   }));
   break;
 }
@@ -242,14 +247,14 @@ La función ya llama a `wsRef.current.sendGroupMessage(content)`. Cifrar antes y
 
 ```ts
 const sendGroupMessage = (content: string) => {
-  if (!groupKey) return;
-  const ciphertext = encryptGroup(content, groupKey);
-  if (ciphertext.length > 1000) {
+  // Si no hay clave grupal, enviar en texto plano (el servidor la tiene vacía)
+  const messageToSend = groupKey ? encryptGroup(content, groupKey) : content;
+  if (messageToSend.length > 1000) {
     // Mostrar error al usuario — el mensaje cifrado supera el límite del servidor
     Alert.alert('Mensaje demasiado largo', 'Acorta el mensaje e intenta de nuevo.');
     return;
   }
-  wsRef.current?.sendGroupMessage(ciphertext);
+  wsRef.current?.sendGroupMessage(messageToSend);
 };
 ```
 
@@ -269,7 +274,28 @@ const sendDirectMessage = (userId: string, content: string) => {
     return;
   }
   wsRef.current?.sendDM(userId, ciphertext);
+
+  // Inserción optimista: mostrar el mensaje localmente en texto plano de inmediato.
+  // El eco del servidor se ignora en el case 'dm' (sender_id === currentUser.id → break).
+  setDirectMessages(prev => ({
+    ...prev,
+    [userId]: [...(prev[userId] ?? []), {
+      id: `send-${Date.now()}`,
+      sender_id: currentUser.id,
+      sender_nickname: currentUser.nickname,
+      content, // texto plano, no cifrado
+      type: 'dm',
+      recipient_id: userId,
+      timestamp: new Date().toISOString(),
+      ttl: null,
+      expires_at: null,
+      allow_read_receipt: true,
+      media: null,
+    }],
+  }));
 };
 ```
+
+> **Nota importante — Inserción optimista:** El remitente **no puede descifrar** sus propios mensajes DM porque `nacl.box` solo permite al destinatario descifrar. Por eso se usa una inserción optimista: el mensaje se agrega a la UI localmente en texto plano inmediatamente después de enviarlo, y el eco del servidor se ignora (`break` cuando `sender_id === currentUser.id`). Esta es la misma técnica que usan Signal y WhatsApp.
 
 > **Nota:** la validación se hace sobre el ciphertext (no el texto plano) porque es lo que viaja al servidor. El usuario ve el texto original en pantalla — solo el servidor rechazaría el mensaje si fuera demasiado largo, así que la validación en frontend previene ese error antes de enviarlo.
